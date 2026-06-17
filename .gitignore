@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.tmp
+~$*
+.cache/
+pollex-term-cache.json
+reference/pollex-synonym-register/register.json
+reference/pollex-synonym-register/register.md
+reference/pollex-synonym-register/pollex-full-snapshot.json
