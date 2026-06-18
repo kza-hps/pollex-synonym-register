@@ -34,7 +34,13 @@ ROOT = Path(__file__).resolve().parents[1]
 REGISTER_DIR = ROOT / "reference" / "pollex-synonym-register"
 REGISTER_JSON = REGISTER_DIR / "register.json"
 REGISTER_MD = REGISTER_DIR / "register.md"
+FULL_SNAPSHOT = REGISTER_DIR / "pollex-full-snapshot.json"
 DEFAULT_CACHE = ROOT / "pollex-term-cache.json"
+
+FLAG_MAP = {
+    "P": "problematic",
+    "I": "phonologically_irregular",
+}
 
 STOPWORDS = {
     "a", "about", "above", "after", "again", "against", "all", "almost",
@@ -277,11 +283,38 @@ def load_from_html(path: Path, register: Register) -> int:
     return count
 
 
+def load_from_snapshot(path: Path, register: Register) -> int:
+    """Load rows from a pollex-full-snapshot.json produced by pollex_full_import.py."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    count = 0
+    for proto in data.get("protoforms", []):
+        level = proto.get("level", "")
+        protoform = proto.get("protoform", "")
+        reconstruction = f"{level}.{protoform}" if level and protoform else protoform or level
+        for reflex in proto.get("reflexes", []):
+            language = reflex.get("language", "")
+            item = reflex.get("item", "")
+            description = reflex.get("description", "")
+            if not all([language, item, description]):
+                continue
+            flags: list[str] = []
+            flag_char = (reflex.get("flag") or "").strip()
+            normalized = FLAG_MAP.get(flag_char)
+            if normalized:
+                flags.append(normalized)
+            if reflex.get("borrowed"):
+                flags.append("borrowed")
+            register.add_row(language, reconstruction, item, description, flags or None)
+            count += 1
+    return count
+
+
 def write_register(register: Register) -> None:
     REGISTER_DIR.mkdir(parents=True, exist_ok=True)
     data = register.to_dict()
     REGISTER_JSON.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
     )
     _write_markdown(data, REGISTER_MD)
     print(f"Written: {REGISTER_JSON}")
@@ -334,37 +367,65 @@ def cmd_build(args: argparse.Namespace) -> None:
     register = Register()
     total = 0
 
-    cache_path = Path(args.cache) if args.cache else (
-        DEFAULT_CACHE if DEFAULT_CACHE.exists() else None
-    )
-    if cache_path:
-        if not cache_path.exists():
-            print(f"Cache file not found: {cache_path}", file=sys.stderr)
-        else:
-            n = load_from_cache(cache_path, register)
-            print(f"Loaded {n} rows from cache: {cache_path}")
+    # Explicit sources requested
+    explicit = any([
+        getattr(args, "snapshot", None),
+        getattr(args, "cache", None),
+        getattr(args, "csv", None),
+        getattr(args, "html", None),
+    ])
+
+    if not explicit:
+        # Auto-detect: prefer full snapshot over audit cache
+        if FULL_SNAPSHOT.exists():
+            n = load_from_snapshot(FULL_SNAPSHOT, register)
+            print(f"Loaded {n:,} rows from full snapshot: {FULL_SNAPSHOT}")
+            total += n
+        elif DEFAULT_CACHE.exists():
+            n = load_from_cache(DEFAULT_CACHE, register)
+            print(f"Loaded {n:,} rows from cache: {DEFAULT_CACHE}")
+            total += n
+    else:
+        if getattr(args, "snapshot", None):
+            p = Path(args.snapshot)
+            if not p.exists():
+                print(f"Snapshot not found: {p}", file=sys.stderr)
+                sys.exit(1)
+            n = load_from_snapshot(p, register)
+            print(f"Loaded {n:,} rows from snapshot: {p}")
             total += n
 
-    if args.csv:
-        n = load_from_csv(Path(args.csv), register)
-        print(f"Loaded {n} rows from CSV: {args.csv}")
-        total += n
+        if getattr(args, "cache", None):
+            p = Path(args.cache)
+            if not p.exists():
+                print(f"Cache not found: {p}", file=sys.stderr)
+                sys.exit(1)
+            n = load_from_cache(p, register)
+            print(f"Loaded {n:,} rows from cache: {p}")
+            total += n
 
-    if args.html:
-        n = load_from_html(Path(args.html), register)
-        print(f"Loaded {n} rows from HTML: {args.html}")
-        total += n
+        if getattr(args, "csv", None):
+            n = load_from_csv(Path(args.csv), register)
+            print(f"Loaded {n:,} rows from CSV: {args.csv}")
+            total += n
+
+        if getattr(args, "html", None):
+            n = load_from_html(Path(args.html), register)
+            print(f"Loaded {n:,} rows from HTML: {args.html}")
+            total += n
 
     if total == 0:
         print(
-            "No source data loaded. Use --cache, --csv, or --html.", file=sys.stderr
+            "No source data loaded. Run 'python tools/pollex_full_import.py harvest' "
+            "or use --snapshot / --cache / --csv / --html.",
+            file=sys.stderr,
         )
         sys.exit(1)
 
     write_register(register)
     print(
-        f"Register built: {len(register.entries)} entries"
-        f" from {len(register.sources)} unique sources."
+        f"Register built: {len(register.entries):,} entries"
+        f" from {len(register.sources):,} unique sources."
     )
 
 
@@ -387,7 +448,7 @@ def _print_entry(key: str, entry: dict, sources: dict) -> None:
 def cmd_lookup(args: argparse.Namespace) -> None:
     if not REGISTER_JSON.exists():
         print(
-            "Register not found. Run: python tools/pollex_synonym_register.py build --csv rows.csv",
+            "Register not found. Run: python tools/pollex_synonym_register.py build",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -428,7 +489,7 @@ def classify_suggestions(entry: dict, entries: dict, sources: dict) -> tuple[lis
 def cmd_suggest(args: argparse.Namespace) -> None:
     if not REGISTER_JSON.exists():
         print(
-            "Register not found. Run: python tools/pollex_synonym_register.py build --csv rows.csv",
+            "Register not found. Run: python tools/pollex_synonym_register.py build",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -440,18 +501,29 @@ def cmd_suggest(args: argparse.Namespace) -> None:
         print(f"No entry found for: {args.word!r}")
         return
 
+    include_flagged = getattr(args, "include_flagged", False)
+
     for entry_id in entry_ids:
         entry = register.entries[entry_id]
         kind_label = "POLLEX reflex" if entry["kind"] == "pollex_reflex" else "English gloss"
-        supported, problematic = classify_suggestions(entry, register.entries, data["sources"])
+        supported, flagged = classify_suggestions(entry, register.entries, data["sources"])
 
         print(f"\nSuggestions for {entry.get('term', entry_id)!r} ({kind_label}):")
         if supported:
             print(f"  Supported: {', '.join(supported)}")
         else:
-            print("  No non-problematic alternatives found.")
-        if problematic:
-            print(f"  Problematic (author/editor review required): {', '.join(problematic)}")
+            print("  No clean alternatives found.")
+        if flagged:
+            if include_flagged:
+                print(
+                    f"  Flagged (borrowed/problematic/irregular — author review required):"
+                    f" {', '.join(flagged)}"
+                )
+            else:
+                print(
+                    f"  ({len(flagged)} flagged alternative(s) hidden"
+                    f" — use --include-flagged to show)"
+                )
 
 
 def run_tests() -> None:
@@ -630,15 +702,20 @@ def run_tests() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="POLLEX Bidirectional Synonym Register - builder and lookup tool."
+        description="POLLEX Bidirectional Synonym Register — builder and lookup tool."
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     build_p = sub.add_parser("build", help="Build/update the register from source inputs.")
     build_p.add_argument(
+        "--snapshot",
+        metavar="PATH",
+        help="Full POLLEX snapshot JSON from pollex_full_import.py harvest",
+    )
+    build_p.add_argument(
         "--cache",
         metavar="PATH",
-        help="POLLEX cache JSON (optional; JSON map of query terms to POLLEX result rows)",
+        help="POLLEX search cache JSON (fallback when no full snapshot exists)",
     )
     build_p.add_argument(
         "--csv",
@@ -659,6 +736,11 @@ def main() -> None:
     )
     suggest_p.add_argument(
         "word", help="English word or POLLEX reflex to suggest alternatives for"
+    )
+    suggest_p.add_argument(
+        "--include-flagged",
+        action="store_true",
+        help="Show borrowed/problematic/irregular alternatives in a separate section",
     )
 
     sub.add_parser("test", help="Run built-in unit tests.")
